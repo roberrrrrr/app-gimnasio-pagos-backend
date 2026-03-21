@@ -23,6 +23,11 @@ const limpiarPagosViejos = async () => {
   await pool.query("DELETE FROM pagos WHERE mes < $1", [mesLimite]);
 };
 
+// Ruta PING para mantener a Render despierto 24/7 sin gastar base de datos
+app.get("/ping", (req, res) => {
+  res.status(200).send("Servidor del gimnasio despierto 🏋️‍♂️");
+});
+
 // 1. OBTENER clientes y su estado en un mes específico
 app.get("/api/clientes", async (req, res) => {
   try {
