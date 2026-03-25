@@ -23,19 +23,24 @@ const limpiarPagosViejos = async () => {
   await pool.query("DELETE FROM pagos WHERE mes < $1", [mesLimite]);
 };
 
-// 0. RUTA PING (Mantiene a Render Y a Neon despiertos)
-app.get("/ping", async (req, res) => {
-  try {
-    // Le hacemos la consulta más mínima posible a Neon para que no se duerma
-    await pool.query("SELECT 1");
-    res
-      .status(200)
-      .send("Render y Neon están despiertos y listos para entrenar 🏋️‍♂️");
-  } catch (error) {
-    console.error("Error en el ping:", error);
-    res.status(500).send("Error al despertar la base de datos");
-  }
+// 0. RUTA PING (Mantiene SOLO a Render despierto para no gastar horas de Neon)
+app.get("/ping", (req, res) => {
+  res.status(200).send("Render despierto 🏋️‍♂️");
 });
+
+// 0. RUTA PING (Mantiene a Render Y a Neon despiertos)
+//app.get("/ping", async (req, res) => {
+//  try {
+//    // Le hacemos la consulta más mínima posible a Neon para que no se duerma
+//    await pool.query("SELECT 1");
+//    res
+//      .status(200)
+//      .send("Render y Neon están despiertos y listos para entrenar 🏋️‍♂️");
+//  } catch (error) {
+//    console.error("Error en el ping:", error);
+//    res.status(500).send("Error al despertar la base de datos");
+//  }
+//});
 
 // 1. OBTENER clientes y su estado en un mes específico
 app.get("/api/clientes", async (req, res) => {
