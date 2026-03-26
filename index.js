@@ -82,14 +82,33 @@ app.get("/api/clientes", async (req, res) => {
   }
 });
 
-// 2. AGREGAR un cliente nuevo (Queda igual, no cambia nada)
+// 2. AGREGAR un cliente nuevo (Evita duplicados)
 app.post("/api/clientes", async (req, res) => {
   try {
     const { nombre } = req.body;
+
+    // 1. Limpiamos espacios extra al principio y al final
+    const nombreLimpio = nombre.trim();
+
+    // 2. Buscamos si ya existe alguien con ese nombre (ILIKE ignora mayúsculas/minúsculas)
+    const busqueda = await pool.query(
+      "SELECT * FROM clientes WHERE nombre ILIKE $1",
+      [nombreLimpio],
+    );
+
+    if (busqueda.rows.length > 0) {
+      return res
+        .status(400)
+        .json({ error: "Ya existe un cliente con ese nombre" });
+    }
+
+    // 3. Si no existe, lo insertamos normal
     const query = "INSERT INTO clientes (nombre) VALUES ($1) RETURNING *";
-    const resultado = await pool.query(query, [nombre]);
+    const resultado = await pool.query(query, [nombreLimpio]);
+
     res.json(resultado.rows[0]);
   } catch (error) {
+    console.error("Error al crear cliente:", error);
     res.status(500).json({ error: "Error al crear cliente" });
   }
 });
