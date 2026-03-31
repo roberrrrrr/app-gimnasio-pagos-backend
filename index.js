@@ -45,28 +45,23 @@ app.get("/ping", (req, res) => {
 // 1. OBTENER clientes y su estado en un mes específico (AHORA CON FECHAS DE PAGO)
 app.get("/api/clientes", async (req, res) => {
   try {
-    await limpiarPagosViejos(); // Limpiamos la BD antes de consultar
-
+    await limpiarPagosViejos();
     const mesSolicitado = req.query.mes;
     if (!mesSolicitado) return res.status(400).json({ error: "Falta el mes" });
 
-    // Calculamos el mes real de HOY en la vida real (ej: "2026-03")
     const fechaHoy = new Date();
     const mesReal = `${fechaHoy.getFullYear()}-${(fechaHoy.getMonth() + 1).toString().padStart(2, "0")}`;
 
-    // --- REGLA 1: EL FUTURO ---
-    if (mesSolicitado > mesReal) {
-      return res.json([]);
-    }
+    if (mesSolicitado > mesReal) return res.json([]);
 
-    // --- REGLA 2: EL PASADO Y PRESENTE ---
-    // Agregamos las fechas de pago actuales y pasadas al SELECT
+    // Agregamos p.monto al SELECT
     const query = `
       SELECT 
         c.id, 
         c.nombre, 
         COALESCE(p.estado, 'pendiente') as estado,
         p.fecha_pago as fecha_pago_actual,
+        p.monto,
         (SELECT MAX(fecha_pago) FROM pagos p2 WHERE p2.cliente_id = c.id AND p2.mes < $1) as ultimo_pago
       FROM clientes c
       LEFT JOIN pagos p ON c.id = p.cliente_id AND p.mes = $1
@@ -74,10 +69,8 @@ app.get("/api/clientes", async (req, res) => {
       ORDER BY c.id DESC
     `;
     const resultado = await pool.query(query, [mesSolicitado]);
-
     res.json(resultado.rows);
   } catch (error) {
-    console.error("Error en la consulta GET:", error);
     res.status(500).json({ error: "Error al obtener clientes" });
   }
 });
@@ -116,19 +109,19 @@ app.post("/api/clientes", async (req, res) => {
 // 3. REGISTRAR UN PAGO (Ahora guarda el día exacto con CURRENT_DATE)
 app.post("/api/pagos", async (req, res) => {
   try {
-    const { cliente_id, mes } = req.body;
-    // Agregamos fecha_pago = CURRENT_DATE tanto al insertar como al actualizar
+    const { cliente_id, mes, monto } = req.body;
+
+    // Insertamos o actualizamos incluyendo el monto
     const query = `
-      INSERT INTO pagos (cliente_id, mes, estado, fecha_pago) 
-      VALUES ($1, $2, 'pagado', CURRENT_DATE)
+      INSERT INTO pagos (cliente_id, mes, estado, fecha_pago, monto) 
+      VALUES ($1, $2, 'pagado', CURRENT_DATE, $3)
       ON CONFLICT (cliente_id, mes) DO UPDATE 
-      SET estado = 'pagado', fecha_pago = CURRENT_DATE
+      SET estado = 'pagado', fecha_pago = CURRENT_DATE, monto = $3
       RETURNING *
     `;
-    const resultado = await pool.query(query, [cliente_id, mes]);
+    const resultado = await pool.query(query, [cliente_id, mes, monto || 0]);
     res.json(resultado.rows[0]);
   } catch (error) {
-    console.error("Error al registrar pago:", error);
     res.status(500).json({ error: "Error al registrar pago" });
   }
 });
