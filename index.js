@@ -116,7 +116,7 @@ app.post("/api/pagos", async (req, res) => {
       INSERT INTO pagos (cliente_id, mes, estado, fecha_pago, monto) 
       VALUES ($1, $2, 'pagado', CURRENT_DATE, $3)
       ON CONFLICT (cliente_id, mes) DO UPDATE 
-      SET estado = 'pagado', fecha_pago = CURRENT_DATE, monto = $3
+      SET estado = 'pagado', monto = $3 
       RETURNING *
     `;
     const resultado = await pool.query(query, [cliente_id, mes, monto || 0]);
