@@ -23,6 +23,13 @@ const limpiarPagosViejos = async () => {
   await pool.query("DELETE FROM pagos WHERE mes < $1", [mesLimite]);
 };
 
+// AUTO-MIGRACIÓN: agrega la columna de baja lógica si no existe (soft delete)
+const inicializarBase = async () => {
+  await pool.query(
+    "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS fecha_baja TIMESTAMP",
+  );
+};
+
 // 0. RUTA PING (Mantiene SOLO a Render despierto para no gastar horas de Neon)
 app.get("/ping", (req, res) => {
   res.status(200).send("Render despierto 🏋️‍♂️");
@@ -66,6 +73,8 @@ app.get("/api/clientes", async (req, res) => {
       FROM clientes c
       LEFT JOIN pagos p ON c.id = p.cliente_id AND p.mes = $1
       WHERE TO_CHAR(c.fecha_inscripcion, 'YYYY-MM') <= $1
+        -- Baja lógica: el cliente aparece en el mes M solo si aún no estaba dado de baja en ese mes
+        AND (c.fecha_baja IS NULL OR TO_CHAR(c.fecha_baja, 'YYYY-MM') > $1)
       ORDER BY c.id DESC
     `;
     const resultado = await pool.query(query, [mesSolicitado]);
@@ -126,16 +135,37 @@ app.post("/api/pagos", async (req, res) => {
   }
 });
 
-// 4. ELIMINAR un cliente
+// 4. DAR DE BAJA un cliente (baja lógica: conserva su historial de pagos)
 app.delete("/api/clientes/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query("DELETE FROM clientes WHERE id = $1", [id]);
-    res.json({ mensaje: "Cliente eliminado" });
+    const resultado = await pool.query(
+      "UPDATE clientes SET fecha_baja = CURRENT_TIMESTAMP WHERE id = $1 AND fecha_baja IS NULL RETURNING *",
+      [id],
+    );
+
+    if (resultado.rowCount === 0) {
+      return res
+        .status(404)
+        .json({ error: "Cliente no encontrado o ya dado de baja" });
+    }
+
+    res.json({ mensaje: "Cliente dado de baja" });
   } catch (error) {
-    res.status(500).json({ error: "Error al eliminar cliente" });
+    console.error("Error al dar de baja cliente:", error);
+    res.status(500).json({ error: "Error al dar de baja cliente" });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
+
+inicializarBase()
+  .then(() => {
+    app.listen(PORT, () =>
+      console.log(`Servidor corriendo en puerto ${PORT}`),
+    );
+  })
+  .catch((error) => {
+    console.error("Error al inicializar la base de datos:", error);
+    process.exit(1);
+  });
