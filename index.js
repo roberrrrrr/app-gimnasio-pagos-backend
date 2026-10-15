@@ -23,11 +23,62 @@ const limpiarPagosViejos = async () => {
   await pool.query("DELETE FROM pagos WHERE mes < $1", [mesLimite]);
 };
 
-// AUTO-MIGRACIÓN: agrega la columna de baja lógica si no existe (soft delete)
+// AUTO-MIGRACIÓN: deja el esquema al día en cada arranque.
+// Todo es idempotente: correr esto 100 veces no rompe ni duplica nada.
 const inicializarBase = async () => {
-  await pool.query(
-    "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS fecha_baja TIMESTAMP",
-  );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Migración 1 (histórica): columna de baja lógica. Queda por compatibilidad,
+    // pero a partir de ahora la fuente de verdad son los ciclos (socios_ciclos).
+    await client.query(
+      "ALTER TABLE clientes ADD COLUMN IF NOT EXISTS fecha_baja TIMESTAMP",
+    );
+
+    // Migración 2: modelo de periodos. Cada fila es una etapa de socio.
+    // fecha_fin NULL = ciclo abierto (socio activo hoy).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS socios_ciclos (
+        id           SERIAL PRIMARY KEY,
+        cliente_id   INTEGER NOT NULL REFERENCES clientes(id) ON DELETE CASCADE,
+        fecha_inicio TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        fecha_fin    TIMESTAMP,
+        CONSTRAINT chk_ciclo_fechas CHECK (fecha_fin IS NULL OR fecha_fin >= fecha_inicio)
+      )
+    `);
+
+    // Un cliente no puede tener dos ciclos abiertos a la vez (regla de negocio en la DB).
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_ciclo_abierto_por_cliente
+        ON socios_ciclos (cliente_id)
+        WHERE fecha_fin IS NULL
+    `);
+
+    // Índice para el EXISTS del listado mes a mes (cubre abiertos y cerrados).
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_socios_ciclos_cliente
+        ON socios_ciclos (cliente_id)
+    `);
+
+    // Backfill idempotente: crea un ciclo por cada cliente que todavía no tenga ninguno.
+    // Mapea el esquema viejo: inscripción -> inicio, baja -> fin (NULL = sigue activo).
+    await client.query(`
+      INSERT INTO socios_ciclos (cliente_id, fecha_inicio, fecha_fin)
+      SELECT c.id, COALESCE(c.fecha_inscripcion, c.fecha_baja, CURRENT_TIMESTAMP), c.fecha_baja
+      FROM clientes c
+      WHERE NOT EXISTS (
+        SELECT 1 FROM socios_ciclos sc WHERE sc.cliente_id = c.id
+      )
+    `);
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 };
 
 // 0. RUTA PING (Mantiene SOLO a Render despierto para no gastar horas de Neon)
@@ -72,9 +123,14 @@ app.get("/api/clientes", async (req, res) => {
         (SELECT MAX(fecha_pago) FROM pagos p2 WHERE p2.cliente_id = c.id AND p2.mes < $1) as ultimo_pago
       FROM clientes c
       LEFT JOIN pagos p ON c.id = p.cliente_id AND p.mes = $1
-      WHERE TO_CHAR(c.fecha_inscripcion, 'YYYY-MM') <= $1
-        -- Baja lógica: el cliente aparece en el mes M solo si aún no estaba dado de baja en ese mes
-        AND (c.fecha_baja IS NULL OR TO_CHAR(c.fecha_baja, 'YYYY-MM') > $1)
+      -- El cliente aparece en el mes M si algún ciclo (etapa) cubrió ese mes.
+      -- Funciona con cualquier cantidad de altas/bajas/reactivaciones.
+      WHERE EXISTS (
+        SELECT 1 FROM socios_ciclos sc
+        WHERE sc.cliente_id = c.id
+          AND TO_CHAR(sc.fecha_inicio, 'YYYY-MM') <= $1
+          AND (sc.fecha_fin IS NULL OR TO_CHAR(sc.fecha_fin, 'YYYY-MM') > $1)
+      )
       ORDER BY c.id DESC
     `;
     const resultado = await pool.query(query, [mesSolicitado]);
@@ -84,34 +140,68 @@ app.get("/api/clientes", async (req, res) => {
   }
 });
 
-// 2. AGREGAR un cliente nuevo (Evita duplicados)
+// 2. AGREGAR un cliente nuevo (o detectar que existe dado de baja para reactivar)
 app.post("/api/clientes", async (req, res) => {
+  const client = await pool.connect();
   try {
     const { nombre } = req.body;
 
-    // 1. Limpiamos espacios extra al principio y al final
+    if (!nombre || !nombre.trim()) {
+      return res.status(400).json({ error: "El nombre es obligatorio" });
+    }
     const nombreLimpio = nombre.trim();
 
-    // 2. Buscamos si ya existe alguien con ese nombre (ILIKE ignora mayúsculas/minúsculas)
-    const busqueda = await pool.query(
-      "SELECT * FROM clientes WHERE nombre ILIKE $1",
+    await client.query("BEGIN");
+
+    // ¿Ya existe alguien con ese nombre? (ILIKE ignora mayúsculas/minúsculas)
+    const busqueda = await client.query(
+      "SELECT id, nombre FROM clientes WHERE nombre ILIKE $1",
       [nombreLimpio],
     );
 
     if (busqueda.rows.length > 0) {
-      return res
-        .status(400)
-        .json({ error: "Ya existe un cliente con ese nombre" });
+      const existente = busqueda.rows[0];
+
+      // ¿Tiene un ciclo abierto? -> está activo, es un duplicado real.
+      const cicloAbierto = await client.query(
+        "SELECT 1 FROM socios_ciclos WHERE cliente_id = $1 AND fecha_fin IS NULL LIMIT 1",
+        [existente.id],
+      );
+
+      await client.query("ROLLBACK");
+
+      if (cicloAbierto.rows.length > 0) {
+        return res
+          .status(400)
+          .json({ error: "Ya existe un cliente con ese nombre" });
+      }
+
+      // Está dado de baja: no es error, requiere confirmación del usuario.
+      return res.status(409).json({
+        error: "Existe un cliente dado de baja con ese nombre",
+        requiereConfirmacion: true,
+        cliente: { id: existente.id, nombre: existente.nombre },
+      });
     }
 
-    // 3. Si no existe, lo insertamos normal
-    const query = "INSERT INTO clientes (nombre) VALUES ($1) RETURNING *";
-    const resultado = await pool.query(query, [nombreLimpio]);
+    // Cliente nuevo: creamos la ficha Y su primer ciclo, en la misma transacción.
+    const nuevo = await client.query(
+      "INSERT INTO clientes (nombre) VALUES ($1) RETURNING *",
+      [nombreLimpio],
+    );
+    await client.query(
+      "INSERT INTO socios_ciclos (cliente_id, fecha_inicio) VALUES ($1, CURRENT_TIMESTAMP)",
+      [nuevo.rows[0].id],
+    );
 
-    res.json(resultado.rows[0]);
+    await client.query("COMMIT");
+    res.json(nuevo.rows[0]);
   } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error("Error al crear cliente:", error);
     res.status(500).json({ error: "Error al crear cliente" });
+  } finally {
+    client.release();
   }
 });
 
@@ -135,12 +225,12 @@ app.post("/api/pagos", async (req, res) => {
   }
 });
 
-// 4. DAR DE BAJA un cliente (baja lógica: conserva su historial de pagos)
+// 4. DAR DE BAJA un cliente (cierra su ciclo abierto: conserva todo el historial)
 app.delete("/api/clientes/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const resultado = await pool.query(
-      "UPDATE clientes SET fecha_baja = CURRENT_TIMESTAMP WHERE id = $1 AND fecha_baja IS NULL RETURNING *",
+      "UPDATE socios_ciclos SET fecha_fin = CURRENT_TIMESTAMP WHERE cliente_id = $1 AND fecha_fin IS NULL RETURNING *",
       [id],
     );
 
@@ -154,6 +244,36 @@ app.delete("/api/clientes/:id", async (req, res) => {
   } catch (error) {
     console.error("Error al dar de baja cliente:", error);
     res.status(500).json({ error: "Error al dar de baja cliente" });
+  }
+});
+
+// 5. REACTIVAR un cliente dado de baja (abre un ciclo nuevo, conserva los anteriores)
+app.put("/api/clientes/:id/reactivar", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const existe = await pool.query(
+      "SELECT id, nombre FROM clientes WHERE id = $1",
+      [id],
+    );
+    if (existe.rows.length === 0) {
+      return res.status(404).json({ error: "Cliente no encontrado" });
+    }
+
+    // El índice único parcial impide dos ciclos abiertos: si ya está activo, falla.
+    await pool.query(
+      "INSERT INTO socios_ciclos (cliente_id, fecha_inicio) VALUES ($1, CURRENT_TIMESTAMP)",
+      [id],
+    );
+
+    res.json({ mensaje: "Cliente reactivado", cliente: existe.rows[0] });
+  } catch (error) {
+    // 23505 = unique_violation (el cliente ya tenía un ciclo abierto)
+    if (error.code === "23505") {
+      return res.status(400).json({ error: "El cliente ya está activo" });
+    }
+    console.error("Error al reactivar cliente:", error);
+    res.status(500).json({ error: "Error al reactivar cliente" });
   }
 });
 
